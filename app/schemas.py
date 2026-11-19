@@ -8,19 +8,20 @@ from pydantic import BaseModel, Field
 
 
 class SourceVersionInfo(BaseModel):
-    kind: Literal["plan", "landing"]
+    kind: Literal["plan", "landing", "link"]
     file_date: str
     version: int
     uploaded_at: str
 
 
 class UploadResponse(BaseModel):
-    kind: Literal["plan", "landing"]
+    kind: Literal["plan", "landing", "link"]
     file_date: str
     version: int
     replaced: bool
     row_count: int
     recomputed_dates: list[str]
+    recomputed_dep_dates: list[str] = Field(default_factory=list)
 
 
 class FactOut(BaseModel):
@@ -50,6 +51,32 @@ class ErrorBody(BaseModel):
 class SourcesResponse(BaseModel):
     plan: list[SourceVersionInfo]
     landing: list[SourceVersionInfo]
+    link: list[SourceVersionInfo] = Field(default_factory=list)
+
+
+class TurnaroundFactOut(BaseModel):
+    next_flight_no: str
+    aircraft: str
+    prev_plan_date: str
+    prev_flight_no: str
+    next_plan_date: str
+    next_dep_airport: str
+    next_dep_min: int
+    prev_arr_min: int | None = None
+    turnaround_min: int | None = None
+    status: Literal["confirmed", "review"]
+    review_reasons: list[str] | None = None
+    review_text: list[str] | None = None
+    missing_sources: list[str] | None = None
+    source_versions: dict[str, int | None]
+
+
+class TurnaroundReportResponse(BaseModel):
+    dep_date: str
+    status: Literal["complete", "incomplete"]
+    missing_sources: list[str]
+    link_version: int | None
+    facts: list[TurnaroundFactOut]
 
 
 class RepairResponse(BaseModel):

@@ -2,6 +2,8 @@
 
 计划 CSV 列：航班号、目的地、计划到达 UTC 分钟、正常/取消
 落地 CSV 列：计划起飞日、航班号、实际机场、实际到达 UTC 分钟
+衔接 CSV 列：机号、前序计划起飞日、前序航班号、后序计划起飞日、
+            后序航班号、后序起飞机场、后序实际起飞 UTC 分钟
 同时兼容常见英文列名。
 """
 
@@ -47,6 +49,81 @@ LANDING_HEADER_ALIASES = {
     },
 }
 
+LINK_HEADER_ALIASES = {
+    # 机号可只给一处（前后序共用），也可分别给前序/后序两处，两处必须一致。
+    "aircraft": {"机号", "飞机号", "航空器", "aircraft", "tail", "tail_no", "tail_number"},
+    "prev_aircraft": {
+        "前序机号",
+        "前段机号",
+        "前机号",
+        "prev_aircraft",
+        "previous_aircraft",
+        "prev_tail",
+        "aircraft_prev",
+    },
+    "next_aircraft": {
+        "后序机号",
+        "后段机号",
+        "后机号",
+        "next_aircraft",
+        "successor_aircraft",
+        "next_tail",
+        "aircraft_next",
+    },
+    "prev_plan_date": {
+        "前序计划起飞日",
+        "前段计划起飞日",
+        "前序计划日",
+        "prev_plan_date",
+        "previous_plan_date",
+        "prev_date",
+    },
+    "prev_flight_no": {
+        "前序航班号",
+        "前段航班号",
+        "前序航班",
+        "prev_flight_no",
+        "previous_flight_no",
+        "prev_flight",
+    },
+    "next_plan_date": {
+        "后序计划起飞日",
+        "后段计划起飞日",
+        "后序计划日",
+        "next_plan_date",
+        "successor_plan_date",
+        "next_date",
+    },
+    "next_flight_no": {
+        "后序航班号",
+        "后段航班号",
+        "后序航班",
+        "next_flight_no",
+        "successor_flight_no",
+        "next_flight",
+    },
+    "next_dep_airport": {
+        "后序起飞机场",
+        "后段起飞机场",
+        "起飞机场",
+        "next_departure_airport",
+        "departure_airport",
+        "next_dep_airport",
+        "dep_airport",
+    },
+    "next_dep_min": {
+        "后序实际起飞utc分钟",
+        "后序实际起飞分钟",
+        "后序起飞utc分钟",
+        "后序起飞分钟",
+        "实际起飞utc分钟",
+        "next_dep_min",
+        "actual_departure_min",
+        "next_departure_min",
+        "dep_min",
+    },
+}
+
 STATUS_ALIASES = {
     "normal": "normal",
     "正常": "normal",
@@ -81,6 +158,27 @@ class LandingRow:
         return add_days(self.plan_date, 1 if self.actual_arr_min >= 24 * 60 else 0)
 
 
+@dataclass(frozen=True)
+class LinkRow:
+    """一条过站衔接：同一机号的前序落地航班与后序起飞航班。"""
+
+    aircraft: str
+    prev_plan_date: str
+    prev_flight_no: str
+    next_plan_date: str
+    next_flight_no: str
+    next_dep_airport: str
+    next_dep_min: int  # 自文件日 UTC 零点起算的起飞分钟（0..1439）
+
+    @property
+    def prev_key(self) -> tuple[str, str]:
+        return (self.prev_plan_date, self.prev_flight_no)
+
+    @property
+    def next_key(self) -> tuple[str, str]:
+        return (self.next_plan_date, self.next_flight_no)
+
+
 def parse_iso_date(value: str, field: str) -> str:
     value = (value or "").strip()
     try:
@@ -109,14 +207,18 @@ def _resolve_columns(
     header: list[str],
     aliases: dict[str, set[str]],
     kind_label: str,
+    optional: set[str] | None = None,
 ) -> dict[str, int]:
     index: dict[str, str] = {}
     for idx, name in enumerate(header):
         index[(name or "").strip().lower().replace(" ", "")] = str(idx)
+    optional = optional or set()
     cols: dict[str, int] = {}
     for canonical, names in aliases.items():
         found = [int(index[n]) for n in names if n in index]
         if not found:
+            if canonical in optional:
+                continue
             raise CSVParseError(
                 f"{kind_label} CSV 缺少列 {canonical}（可接受列名：{sorted(names)}）"
             )
@@ -235,6 +337,101 @@ def parse_landing_csv(content: bytes, file_date: str) -> list[LandingRow]:
         seen_keys.add(key)
         result.append(parsed)
     # 允许仅含表头的落地文件：表示该落地日没有落地（可用于整批清空替换）。
+    return result
+
+
+def parse_link_csv(content: bytes, file_date: str) -> list[LinkRow]:
+    """解析过站衔接清单。
+
+    file_date 为后序实际起飞的 UTC 日；两段计划起飞日只允许是文件日或前一天，
+    后序起飞分钟自文件日 UTC 零点起算，因此只允许 [0, 1439]。
+    """
+    text = _decode(content)
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration as exc:
+        raise CSVParseError("衔接 CSV 为空文件") from exc
+    cols = _resolve_columns(
+        header,
+        LINK_HEADER_ALIASES,
+        "衔接",
+        optional={"aircraft", "prev_aircraft", "next_aircraft"},
+    )
+    if not ({"aircraft", "prev_aircraft", "next_aircraft"} & cols.keys()):
+        raise CSVParseError(
+            "衔接 CSV 缺少机号列（可接受列名：机号 / 前序机号 / 后序机号）"
+        )
+    aircraft_cols = [
+        cols[name]
+        for name in ("aircraft", "prev_aircraft", "next_aircraft")
+        if name in cols
+    ]
+    allowed_dates = {file_date, add_days(file_date, -1)}
+
+    result: list[LinkRow] = []
+    for line_no, row in enumerate(reader, start=2):
+        if not any(cell.strip() for cell in row):
+            continue
+        aircraft_values = {_cell(row, idx) for idx in aircraft_cols}
+        aircraft_values.discard("")
+        if not aircraft_values:
+            raise CSVParseError(f"衔接 CSV 第 {line_no} 行机号为空")
+        if len(aircraft_values) > 1:
+            raise CSVParseError(
+                f"衔接 CSV 第 {line_no} 行两处机号不一致：{sorted(aircraft_values)}"
+            )
+        aircraft = aircraft_values.pop()
+
+        prev_plan_date = parse_iso_date(
+            _cell(row, cols["prev_plan_date"]),
+            f"衔接 CSV 第 {line_no} 行前序计划起飞日",
+        )
+        next_plan_date = parse_iso_date(
+            _cell(row, cols["next_plan_date"]),
+            f"衔接 CSV 第 {line_no} 行后序计划起飞日",
+        )
+        for label, value in (("前序", prev_plan_date), ("后序", next_plan_date)):
+            if value not in allowed_dates:
+                raise CSVParseError(
+                    f"衔接 CSV 第 {line_no} 行{label}计划起飞日 {value} 必须是"
+                    f"文件日 {file_date} 或前一天 {add_days(file_date, -1)}"
+                )
+        prev_flight_no = _cell(row, cols["prev_flight_no"])
+        if not prev_flight_no:
+            raise CSVParseError(f"衔接 CSV 第 {line_no} 行前序航班号为空")
+        next_flight_no = _cell(row, cols["next_flight_no"])
+        if not next_flight_no:
+            raise CSVParseError(f"衔接 CSV 第 {line_no} 行后序航班号为空")
+        if (prev_plan_date, prev_flight_no) == (next_plan_date, next_flight_no):
+            raise CSVParseError(
+                f"衔接 CSV 第 {line_no} 行前序与后序是同一航班 "
+                f"{prev_flight_no}（计划日 {prev_plan_date}），必须为两段不同航班"
+            )
+        airport = _cell(row, cols["next_dep_airport"])
+        if not airport:
+            raise CSVParseError(f"衔接 CSV 第 {line_no} 行后序起飞机场为空")
+        minutes = _parse_minutes(
+            _cell(row, cols["next_dep_min"]),
+            f"衔接 CSV 第 {line_no} 行后序实际起飞分钟",
+        )
+        if minutes > config.MAX_UTC_MINUTES:
+            raise CSVParseError(
+                f"衔接 CSV 第 {line_no} 行后序实际起飞分钟必须自文件日 UTC 零点起算"
+                f"且在 [0, 1439] 内：{minutes}"
+            )
+        result.append(
+            LinkRow(
+                aircraft=aircraft,
+                prev_plan_date=prev_plan_date,
+                prev_flight_no=prev_flight_no,
+                next_plan_date=next_plan_date,
+                next_flight_no=next_flight_no,
+                next_dep_airport=airport,
+                next_dep_min=minutes,
+            )
+        )
+    # 允许仅含表头的衔接文件：表示该起飞日没有衔接（整批清空）。
     return result
 
 
